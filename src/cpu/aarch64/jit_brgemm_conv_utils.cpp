@@ -55,10 +55,16 @@ bool allow_perf_heuristics(const jit_brgemm_conv_conf_t &jcp) {
     return true;
 }
 
+int mmla_conv_wei_k_block(const jit_brgemm_conv_conf_t &jcp) {
+    return jcp.wei_dt == data_type::s8
+            ? brgemm_utils::mmla_rd_chunk_elems(jcp.wei_dsz)
+            : brgemm_utils::mmla_rd_block(jcp.wei_dsz);
+}
+
 bool use_bf16_mmla(const jit_brgemm_conv_conf_t &jcp,
         const memory_desc_t &weights_md, bool is_1x1_path) {
     const int n_block = brgemm_utils::mmla_n_block(jcp.isa);
-    const int k_block = brgemm_utils::mmla_rd_block();
+    const int k_block = mmla_conv_wei_k_block(jcp);
     const bool isa_ok
             = mayiuse_bf16() && utils::one_of(jcp.isa, sve_128, sve_256);
     const bool problem_ok = jcp.prop_kind == prop_kind::forward_inference
@@ -86,13 +92,83 @@ bool use_bf16_mmla(const jit_brgemm_conv_conf_t &jcp,
     return layout_ok;
 }
 
-// MMLA convolution requires packed weights and complete N/K tiles. It does
-// not support BRGEMM masks for irregular output-spatial rows or internally
-// padded input channels. The 3x3 path handles borders through virtual padding.
+// These are conservative dispatch-policy thresholds, not correctness limits.
+// MMLA needs enough reduction and spatial work to amortize its setup; DOT can
+// be faster when scheduling and setup dominate a small problem. Keep a
+// portable fallback because the exact crossover varies by ISA and platform.
+constexpr int int8_mmla_1x1_min_ic = 64;
+constexpr int int8_mmla_1x1_min_os = 400;
+
+// Source-zero-point MMLA builds per-M virtual-padding compensation outside
+// BRGEMM. The work ratio amortizes the compensation table, the spatial floor
+// rejects short M dimensions, and the normalized work-per-thread floor avoids
+// spreading too little compute across the configured workers. These are
+// performance-policy guards derived from SVE128 and SVE256 measurements, not
+// kernel correctness constraints. Normalized work omits the fixed 3x3 factor.
+constexpr int int8_mmla_vpad_comp_min_ic = 16;
+constexpr int int8_mmla_vpad_comp_min_work_ratio = 8;
+constexpr dim_t int8_mmla_vpad_comp_min_spatial_work = 160;
+constexpr dim_t int8_mmla_vpad_comp_min_work_per_thread = 192 * 1024;
+
+// Byte-MMLA currently requires the default weight zero point (zero). Keep
+// nonzero weight zero points off this path until compensation is validated.
+bool use_int8_mmla_3x3(
+        const jit_brgemm_conv_conf_t &jcp, const primitive_attr_t &attr) {
+    const int n_block = brgemm_utils::mmla_n_block(jcp.isa);
+    const int k_block = mmla_conv_wei_k_block(jcp);
+    const bool isa_ok
+            = mayiuse_sve_i8mm() && utils::one_of(jcp.isa, sve_128, sve_256);
+    const bool problem_ok = jcp.prop_kind == prop_kind::forward_inference
+            && jcp.ndims == 4 && jcp.ngroups == 1 && jcp.src_dt == data_type::u8
+            && jcp.wei_dt == data_type::s8;
+    const bool shape_ok = jcp.kd == 1 && jcp.kh == 3 && jcp.kw == 3
+            && jcp.dilate_d == 0 && jcp.dilate_h == 0 && jcp.dilate_w == 0
+            && jcp.ic % k_block == 0 && jcp.oc % n_block == 0
+            && utils::one_of(jcp.stride_h, 1, 2)
+            && jcp.stride_w == jcp.stride_h;
+    const bool attr_ok = attr.zero_points_.has_default_values(DNNL_ARG_WEIGHTS);
+    return isa_ok && problem_ok && shape_ok && attr_ok;
+}
+
+bool use_int8_mmla_1x1(const jit_brgemm_conv_conf_t &jcp,
+        const primitive_attr_t &attr, const memory_desc_t &weights_md) {
+    const int n_block = brgemm_utils::mmla_n_block(jcp.isa);
+    const int k_block = brgemm_utils::mmla_rd_block(jcp.wei_dsz);
+    const int wei_k_block = mmla_conv_wei_k_block(jcp);
+    const bool isa_ok
+            = mayiuse_sve_i8mm() && utils::one_of(jcp.isa, sve_128, sve_256);
+    const bool problem_ok = jcp.prop_kind == prop_kind::forward_inference
+            && jcp.ndims == 4 && jcp.ngroups == 1 && jcp.src_dt == data_type::u8
+            && jcp.wei_dt == data_type::s8;
+    const bool shape_ok = jcp.is_1x1 && jcp.kd == 1 && jcp.kh == 1
+            && jcp.kw == 1 && jcp.dilate_d == 0 && jcp.dilate_h == 0
+            && jcp.dilate_w == 0 && jcp.stride_d == 1 && jcp.stride_h == 1
+            && jcp.stride_w == 1 && jcp.ic % k_block == 0
+            && jcp.oc % n_block == 0;
+    auto want_weights_md = weights_md;
+    const memory_desc_wrapper weights_d(&weights_md);
+    const bool weights_any = weights_d.format_kind() == format_kind::any;
+    const bool explicit_mmla_weights = !weights_any
+            && brgemm_utils::init_mmla_wei_md(
+                       want_weights_md, 1, 0, n_block, wei_k_block)
+                    == status::success
+            && weights_md == want_weights_md;
+    const bool profitable
+            = jcp.ic >= int8_mmla_1x1_min_ic && jcp.os >= int8_mmla_1x1_min_os;
+    const bool attr_ok = attr.zero_points_.has_default_values(DNNL_ARG_WEIGHTS);
+    return isa_ok && problem_ok && shape_ok
+            && (weights_any || explicit_mmla_weights)
+            && (profitable || explicit_mmla_weights) && attr_ok;
+}
+
+// MMLA convolution requires packed weights, complete N tiles, and complete K
+// subpanels. BRGEMM masks for irregular output-spatial rows and implicit input
+// channel padding are not supported. The 3x3 path handles borders through
+// virtual padding.
 bool native_mmla_blocking_ok(
         const jit_brgemm_conv_conf_t &jcp, bool require_vpad) {
     const int n_block = brgemm_utils::mmla_n_block(jcp.isa);
-    const int k_block = brgemm_utils::mmla_rd_block();
+    const int k_block = mmla_conv_wei_k_block(jcp);
     const bool execution_ok
             = IMPLICATION(require_vpad, jcp.exec_type == exec_vpad)
             && !jcp.use_M_mask;
@@ -101,7 +177,7 @@ bool native_mmla_blocking_ok(
             = jcp.oc_block == n_block && jcp.N == n_block && jcp.N_tail == 0;
     const bool k_blocking_ok = jcp.K % k_block == 0
             && (jcp.K_tail == 0 || jcp.K_tail % k_block == 0)
-            && jcp.ic_block % k_block == 0;
+            && jcp.ic_block % k_block == 0 && jcp.icp % k_block == 0;
     return execution_ok && weights_ok && n_blocking_ok && k_blocking_ok;
 }
 
@@ -225,8 +301,8 @@ status_t pick_tags(jit_brgemm_conv_conf_t &jcp, memory_desc_t &src_md,
                     && jcp.oc_block == brgemm_utils::mmla_n_block(jcp.isa);
             if (!layout_ok) return status::unimplemented;
             auto want_weights_md = weights_md;
-            CHECK(brgemm_utils::init_mmla_wei_md(
-                    want_weights_md, 1, 0, jcp.oc_block));
+            CHECK(brgemm_utils::init_mmla_wei_md(want_weights_md, 1, 0,
+                    jcp.oc_block, mmla_conv_wei_k_block(jcp)));
             if (weights_d.format_kind() == format_kind::any)
                 weights_md = want_weights_md;
             else if (weights_md != want_weights_md)
@@ -1807,9 +1883,11 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
         }
     }
 
-    jcp.use_mmla = allow_mmla && use_bf16_mmla(jcp, weights_md, false);
+    jcp.use_mmla = allow_mmla
+            && (use_bf16_mmla(jcp, weights_md, false)
+                    || use_int8_mmla_3x3(jcp, attr));
     brg_blocking_t::last_ic_block_size = jcp.use_mmla
-            ? brgemm_utils::mmla_rd_block()
+            ? mmla_conv_wei_k_block(jcp)
             : data_type_vnni_granularity(jcp.wei_dt);
 
     // TODO: optimize depthwise convolutions (for now direct approach is faster)
@@ -2120,9 +2198,8 @@ static status_t init_conf_impl(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     if (one_of(jcp.src_dt, u8, s8) && !is_ok_large_spatial)
         if (allow_perf_heuristics(jcp)) return status::unimplemented;
 
-    // For padding shapes, we calculate the comp along with the computation
-    // inside brgemm kernel when output size is small to get optimal perf
-    // Or we calculate the comp using brgemm_coomp_pad kernel
+    // Small padded problems calculate compensation inside BRGEMM. Larger
+    // problems use the separate compensation kernel.
     const auto output_sz = static_cast<dim_t>(jcp.mb) * jcp.ngroups * jcp.oc
             * jcp.od * jcp.oh * jcp.ow;
     const auto comp_with_pads
@@ -2130,6 +2207,34 @@ static status_t init_conf_impl(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
             && IMPLICATION(jcp.exec_type == exec_vpad, with_pad);
     jcp.req_brg_comp_pad = comp_with_pads && output_sz <= 8192 && jcp.oc < 512;
     jcp.req_cal_comp_pad = comp_with_pads && !jcp.req_brg_comp_pad;
+    // Integer MMLA cannot calculate padding compensation in its reduction
+    // loop. Build per-M compensation when profitable; otherwise init_conf
+    // retries DOT.
+    const auto vpad_comp_boundary_work
+            = static_cast<dim_t>(jcp.mb) * jcp.oh * jcp.ic;
+    const auto vpad_comp_table_work = static_cast<dim_t>(jcp.ic) + jcp.ow;
+    const auto vpad_comp_spatial_work
+            = static_cast<dim_t>(jcp.mb) * jcp.oh * jcp.ow;
+    const auto vpad_comp_compute_work
+            = vpad_comp_spatial_work * jcp.ic * jcp.oc;
+    const auto vpad_comp_thread_work
+            = static_cast<dim_t>(nstl::max(1, jcp.nthr))
+            * int8_mmla_vpad_comp_min_work_per_thread;
+    const bool is_vpad_comp_profitable = jcp.ic >= int8_mmla_vpad_comp_min_ic
+            && vpad_comp_boundary_work
+                    >= int8_mmla_vpad_comp_min_work_ratio * vpad_comp_table_work
+            && vpad_comp_spatial_work >= int8_mmla_vpad_comp_min_spatial_work
+            && vpad_comp_compute_work >= vpad_comp_thread_work;
+    const bool is_int8_mmla = jcp.use_mmla && jcp.src_dt == data_type::u8
+            && jcp.wei_dt == data_type::s8;
+    jcp.use_mmla_vpad_comp = is_int8_mmla && jcp.exec_type == exec_vpad
+            && jcp.src_zero_point && !jcp.s8s8_compensation_required
+            && jcp.req_cal_comp_pad && jcp.max_vpad > 0
+            && is_vpad_comp_profitable;
+    if (is_int8_mmla && jcp.src_zero_point
+            && (jcp.req_brg_comp_pad
+                    || (jcp.max_vpad > 0 && !jcp.use_mmla_vpad_comp)))
+        return status::unimplemented;
 
     // estimate the number of kernel range combination for compensation
     const auto kd_cnt = 1 + utils::div_up(abs(jcp.f_pad), jcp.dilate_d + 1)
@@ -2145,9 +2250,11 @@ static status_t init_conf_impl(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
 
     jcp.ker_ranges_size = jcp.exec_type == exec_base ? kd_cnt * kh_cnt * kw_cnt
                                                      : kd_cnt * kh_cnt;
-    jcp.comp_a_buffer_size
+    const auto comp_a_spatial_size = jcp.use_mmla_vpad_comp ? jcp.ow : 1;
+    jcp.comp_a_buffer_size = jcp.ngroups * jcp.nb_oc * jcp.ker_ranges_size
+            * comp_a_spatial_size * jcp.oc_block;
+    jcp.s8s8_comp_buffer_size
             = jcp.ngroups * jcp.nb_oc * jcp.ker_ranges_size * jcp.oc_block;
-    jcp.s8s8_comp_buffer_size = jcp.comp_a_buffer_size;
 
     // enable ununroll_bd_loop for big shapes to reduce kernel sizes
     jcp.ununroll_bd_loop
@@ -2164,7 +2271,7 @@ status_t init_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
         memory_desc_t &weights_md, memory_desc_t &dst_md,
         memory_desc_t &bias_md, primitive_attr_t &attr, int nthreads) {
     // MMLA constrains the selected blocking. Preserve the user descriptors so
-    // a rejected MMLA candidate can retry through the existing BFDOT path.
+    // a rejected MMLA candidate can retry through the existing DOT path.
     const auto src_md_orig = src_md;
     const auto weights_md_orig = weights_md;
     const auto dst_md_orig = dst_md;
@@ -2203,9 +2310,10 @@ status_t init_1x1_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
 
     if (!jcp.is_1x1) return status::unimplemented;
 
-    jcp.use_mmla = use_bf16_mmla(jcp, weights_md, true);
+    jcp.use_mmla = use_bf16_mmla(jcp, weights_md, true)
+            || use_int8_mmla_1x1(jcp, attr, weights_md);
     brg_blocking_t::last_ic_block_size = jcp.use_mmla
-            ? brgemm_utils::mmla_rd_block()
+            ? mmla_conv_wei_k_block(jcp)
             : data_type_vnni_granularity(jcp.wei_dt);
 
     using namespace data_type;

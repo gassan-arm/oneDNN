@@ -20,6 +20,10 @@
 
 #include "oneapi/dnnl/dnnl.hpp"
 
+#if DNNL_AARCH64
+#include "common/dnnl_thread.hpp"
+#endif
+
 #include "tests/test_isa_common.hpp"
 
 namespace dnnl {
@@ -175,6 +179,41 @@ bool has_bf16_mmla(const engine &eng) {
     return pd.get() != nullptr && is_bf16_mmla_weights(pd.weights_desc());
 }
 
+convolution_forward::primitive_desc make_int8_mmla_conv_pd(const engine &eng,
+        memory::data_type src_type, const memory::desc &weights_md,
+        memory::dim ih = 16, memory::dim iw = 16, memory::dim stride = 1,
+        memory::dim padding = 1, memory::dim mb = 1,
+        bool source_zero_point = false, bool allow_empty = false) {
+    const auto weights_dims = weights_md.get_dims();
+    const auto oc = weights_dims[0];
+    const auto ic = weights_dims[1];
+    const auto kh = weights_dims[2];
+    const auto kw = weights_dims[3];
+    const auto oh = (ih + 2 * padding - kh) / stride + 1;
+    const auto ow = (iw + 2 * padding - kw) / stride + 1;
+    const auto src_md = memory::desc({mb, ic, ih, iw}, src_type, tag::nhwc);
+    const auto dst_md
+            = memory::desc({mb, oc, oh, ow}, memory::data_type::f32, tag::nhwc);
+    primitive_attr attr;
+    if (source_zero_point) attr.set_zero_points_mask(DNNL_ARG_SRC, 0);
+    return convolution_forward::primitive_desc(eng,
+            prop_kind::forward_inference, algorithm::convolution_direct, src_md,
+            weights_md, memory::desc(), dst_md, {stride, stride},
+            {padding, padding}, {padding, padding}, attr, allow_empty);
+}
+
+bool is_int8_mmla_weights(const memory::desc &desc) {
+    return aarch64_mmla_test::matches_weights_desc(desc, 1, 0, 8);
+}
+
+bool has_int8_mmla(const engine &eng) {
+    const auto any
+            = memory::desc({64, 64, 3, 3}, memory::data_type::s8, tag::any);
+    const auto pd = make_int8_mmla_conv_pd(
+            eng, memory::data_type::u8, any, 16, 16, 1, 1, 1, false, true);
+    return pd.get() != nullptr && is_int8_mmla_weights(pd.weights_desc());
+}
+
 } // namespace
 
 TEST(AArch64MmlaConvolution, Bf16SelectionAndFallbacks) {
@@ -239,6 +278,100 @@ TEST(AArch64MmlaConvolution, Bf16ExplicitWeights) {
     const auto dot_pd = make_bf16_mmla_conv_pd(eng, dot, 16, 16, 1, 0);
     EXPECT_EQ(dot_pd.weights_desc(), dot);
     EXPECT_FALSE(is_bf16_mmla_weights(dot_pd.weights_desc()));
+}
+
+TEST(AArch64MmlaConvolution, Int8SelectionAndExplicitWeights) {
+    SKIP_IF(get_test_engine_kind() != engine::kind::cpu,
+            "This test targets the CPU convolution implementation.");
+
+    auto eng = get_test_engine();
+    SKIP_IF(!has_int8_mmla(eng), "This test targets AArch64 SVE-I8MM.");
+
+    const auto any_3x3
+            = memory::desc({64, 64, 3, 3}, memory::data_type::s8, tag::any);
+    const auto selected_3x3
+            = make_int8_mmla_conv_pd(eng, memory::data_type::u8, any_3x3);
+    EXPECT_TRUE(is_int8_mmla_weights(selected_3x3.weights_desc()));
+
+    const auto any_5x5
+            = memory::desc({64, 64, 5, 5}, memory::data_type::s8, tag::any);
+    const auto kernel_fallback = make_int8_mmla_conv_pd(
+            eng, memory::data_type::u8, any_5x5, 16, 16, 1, 2);
+    EXPECT_FALSE(is_int8_mmla_weights(kernel_fallback.weights_desc()));
+
+    const auto any_1x1
+            = memory::desc({64, 64, 1, 1}, memory::data_type::s8, tag::any);
+    const auto below_threshold = make_int8_mmla_conv_pd(
+            eng, memory::data_type::u8, any_1x1, 21, 19, 1, 0);
+    EXPECT_FALSE(is_int8_mmla_weights(below_threshold.weights_desc()));
+
+    const auto at_threshold = make_int8_mmla_conv_pd(
+            eng, memory::data_type::u8, any_1x1, 20, 20, 1, 0);
+    EXPECT_TRUE(is_int8_mmla_weights(at_threshold.weights_desc()));
+
+    // Explicit layouts remain authoritative across the profitability
+    // boundary in either direction.
+    const auto explicit_mmla = make_int8_mmla_conv_pd(eng,
+            memory::data_type::u8, at_threshold.weights_desc(), 21, 19, 1, 0);
+    EXPECT_EQ(explicit_mmla.weights_desc(), at_threshold.weights_desc());
+    EXPECT_TRUE(is_int8_mmla_weights(explicit_mmla.weights_desc()));
+
+    const auto explicit_dot = make_int8_mmla_conv_pd(eng, memory::data_type::u8,
+            below_threshold.weights_desc(), 20, 20, 1, 0);
+    EXPECT_EQ(explicit_dot.weights_desc(), below_threshold.weights_desc());
+    EXPECT_FALSE(is_int8_mmla_weights(explicit_dot.weights_desc()));
+}
+
+TEST(AArch64MmlaConvolution, Int8VpadCompensationBoundaries) {
+    SKIP_IF(get_test_engine_kind() != engine::kind::cpu,
+            "This test targets the CPU convolution implementation.");
+
+    auto eng = get_test_engine();
+    SKIP_IF(!has_int8_mmla(eng), "This test targets AArch64 SVE-I8MM.");
+    const auto any
+            = memory::desc({64, 64, 3, 3}, memory::data_type::s8, tag::any);
+
+    // This shape uses BRGEMM-owned padding compensation, which integer MMLA
+    // cannot consume, so it must retry through DOT.
+    const auto inline_comp = make_int8_mmla_conv_pd(
+            eng, memory::data_type::u8, any, 8, 8, 1, 1, 2, true);
+    EXPECT_FALSE(is_int8_mmla_weights(inline_comp.weights_desc()));
+
+    // At one thread this sits exactly on the ratio boundary and has enough
+    // normalized work. With multiple threads, per-thread work is too small.
+    const auto any_ic16
+            = memory::desc({64, 16, 3, 3}, memory::data_type::s8, tag::any);
+    const auto thread_limited = make_int8_mmla_conv_pd(
+            eng, memory::data_type::u8, any_ic16, 16, 16, 1, 1, 1, true);
+    EXPECT_EQ(is_int8_mmla_weights(thread_limited.weights_desc()),
+            dnnl_get_max_threads() == 1);
+
+    // A large output-channel count alone does not amortize a short M
+    // dimension; retain DOT even though separate compensation is available.
+    const auto any_high_oc
+            = memory::desc({512, 64, 3, 3}, memory::data_type::s8, tag::any);
+    const auto short_m = make_int8_mmla_conv_pd(
+            eng, memory::data_type::u8, any_high_oc, 9, 8, 1, 1, 1, true);
+    EXPECT_FALSE(is_int8_mmla_weights(short_m.weights_desc()));
+
+    // This has enough spatial, compensation-amortization, and per-thread work
+    // to retain MMLA even on a many-core system.
+    const auto any_large
+            = memory::desc({256, 128, 3, 3}, memory::data_type::s8, tag::any);
+    const auto selected = make_int8_mmla_conv_pd(
+            eng, memory::data_type::u8, any_large, 28, 28, 1, 1, 4, true);
+    EXPECT_TRUE(is_int8_mmla_weights(selected.weights_desc()));
+
+    const auto src_md
+            = memory::desc({1, 64, 8, 8}, memory::data_type::u8, tag::nhwc);
+    const auto dst_md
+            = memory::desc({1, 64, 8, 6}, memory::data_type::f32, tag::nhwc);
+    primitive_attr attr;
+    attr.set_zero_points_mask(DNNL_ARG_SRC, 0);
+    const auto vertical_only = convolution_forward::primitive_desc(eng,
+            prop_kind::forward_inference, algorithm::convolution_direct, src_md,
+            any, memory::desc(), dst_md, {1, 1}, {1, 0}, {1, 0}, attr);
+    EXPECT_FALSE(is_int8_mmla_weights(vertical_only.weights_desc()));
 }
 #endif
 } // namespace dnnl
